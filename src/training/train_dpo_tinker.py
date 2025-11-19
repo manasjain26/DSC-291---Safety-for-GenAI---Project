@@ -107,38 +107,60 @@ class DPOTrainer:
                     )
                     batch.extend(pair_datums)  # Flatten the pairs
                 
-                # Training step
-                metrics = self.client.train_step(
-                    batch=batch,
-                    learning_rate=self.learning_rate,
-                    dpo_beta=self.dpo_beta
-                )
-                
-                step += 1
-                
-                # Log metrics
-                if step % 10 == 0:
-                    print(f"\nStep {step}: {metrics}")
-                
-                # Save checkpoint
-                if step % save_steps == 0:
-                    self.save_checkpoint(step)
+                # Training step with error handling
+                try:
+                    metrics = self.client.train_step(
+                        batch=batch,
+                        learning_rate=self.learning_rate,
+                        dpo_beta=self.dpo_beta
+                    )
+                    
+                    step += 1
+                    
+                    # Log metrics
+                    if step % 10 == 0:
+                        print(f"\nStep {step}: {metrics}")
+                    
+                    # Save checkpoint
+                    if step % save_steps == 0:
+                        print(f"\n📝 Saving checkpoint at step {step}...")
+                        self.save_checkpoint(step)
+                        
+                except Exception as e:
+                    print(f"\n❌ Error at step {step}, batch {i//batch_size + 1}: {e}")
+                    print(f"   Saving emergency checkpoint...")
+                    try:
+                        self.save_checkpoint(step, emergency=True)
+                    except:
+                        pass
+                    raise
         
         # Final save
         print("\nTraining complete! Saving final model...")
         final_model_name = f"{self.base_model.split('/')[-1]}-dpo-final"
-        sampling_client = self.client.save_and_get_sampling_client(name=final_model_name)
+        result = self.client.training_client.save_weights_for_sampler(name=final_model_name).result()
+        final_path = result.path
         
         print(f"✓ Model saved as: {final_model_name}")
-        print(f"  Access with: tinker://{final_model_name}")
+        print(f"  Full path: {final_path}")
+        print(f"\nTo evaluate, run:")
+        print(f"  python src/evaluation/evaluate_tinker.py \\")
+        print(f"    --model-path {final_path} \\")
+        print(f"    --test-file data/processed/advbench/test.jsonl")
         
-        return sampling_client
+        # Also get sampling client for immediate use
+        sampling_client = self.client.save_and_get_sampling_client(name=final_model_name)
+        
+        return sampling_client, final_path
     
-    def save_checkpoint(self, step: int):
-        """Save training checkpoint."""
-        checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-step{step}"
-        self.client.save_and_get_sampling_client(name=checkpoint_name)
-        print(f"✓ Checkpoint saved: {checkpoint_name}")
+    def save_checkpoint(self, step: int, emergency: bool = False):
+        """Save training checkpoint and return the path."""
+        prefix = "emergency-" if emergency else ""
+        checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-{prefix}step{step}"
+        print(f"  Saving to: {checkpoint_name}")
+        result = self.client.training_client.save_weights_for_sampler(name=checkpoint_name).result()
+        print(f"  ✓ Checkpoint saved: {result.path}")
+        return result.path
 
 
 def main():

@@ -11,15 +11,18 @@ from dotenv import load_dotenv
 import json
 from pathlib import Path
 import torch
+import time
 
 try:
     import tinker
     from tinker import types, TensorData
+    from tinker.lib.retryable_exception import RetryableException
     import numpy as np
     TINKER_AVAILABLE = True
 except ImportError:
     TINKER_AVAILABLE = False
     print("Warning: Tinker SDK not installed. Install with: pip install tinker")
+    RetryableException = Exception  # Fallback
 
 load_dotenv()
 
@@ -173,7 +176,8 @@ class TinkerTrainingClient:
         self,
         batch: List[types.Datum],
         learning_rate: float = 1e-5,
-        dpo_beta: float = 0.1
+        dpo_beta: float = 0.1,
+        max_retries: int = 3
     ) -> Dict[str, float]:
         """
         Perform one training step with DPO loss using forward_backward_custom.
@@ -182,6 +186,7 @@ class TinkerTrainingClient:
             batch: List of Datum objects (interleaved chosen/rejected pairs)
             learning_rate: Learning rate for optimizer
             dpo_beta: DPO beta parameter
+            max_retries: Maximum number of retries on failure
             
         Returns:
             Dictionary of training metrics
@@ -190,16 +195,30 @@ class TinkerTrainingClient:
         chosen_data = [batch[i] for i in range(0, len(batch), 2)]
         rejected_data = [batch[i] for i in range(1, len(batch), 2)]
         
-        # Get reference logprobs for all data
+        # Get reference logprobs for all data with retry logic
         all_ref_logprobs = []
-        for datum in batch:
-            # Reconstruct full sequence
-            target_tokens = datum.loss_fn_inputs["target_tokens"].data
-            full_seq = datum.model_input.append_int(int(target_tokens[-1]))
-            
-            # Compute ref logprobs
-            result = self.reference_client.compute_logprobs(full_seq).result()
-            all_ref_logprobs.append(torch.tensor(result[1:]))  # Skip first token
+        for idx, datum in enumerate(batch):
+            for retry in range(max_retries):
+                try:
+                    # Reconstruct full sequence
+                    target_tokens = datum.loss_fn_inputs["target_tokens"].data
+                    full_seq = datum.model_input.append_int(int(target_tokens[-1]))
+                    
+                    # Compute ref logprobs
+                    result = self.reference_client.compute_logprobs(full_seq).result()
+                    all_ref_logprobs.append(torch.tensor(result[1:]))  # Skip first token
+                    break
+                except RetryableException as e:
+                    if retry < max_retries - 1:
+                        wait_time = 2 ** retry  # Exponential backoff
+                        print(f"  Retry {retry + 1}/{max_retries} for ref logprobs (datum {idx + 1}/{len(batch)}), waiting {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"  Failed to get ref logprobs after {max_retries} retries")
+                        raise
+                except Exception as e:
+                    print(f"  Non-retryable error getting ref logprobs: {e}")
+                    raise
         
         # Split ref logprobs into chosen and rejected
         chosen_ref_logprobs = [all_ref_logprobs[i] for i in range(0, len(batch), 2)]
@@ -245,12 +264,44 @@ class TinkerTrainingClient:
                 dpo_beta=dpo_beta
             )
         
-        # Forward-backward with custom loss
-        backward_result = self.training_client.forward_backward_custom(batch, dpo_loss_fn).result()
+        # Forward-backward with custom loss (with retry)
+        backward_result = None
+        for retry in range(max_retries):
+            try:
+                backward_result = self.training_client.forward_backward_custom(batch, dpo_loss_fn).result()
+                break
+            except RetryableException as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry
+                    print(f"  Retry {retry + 1}/{max_retries} for forward_backward, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Failed forward_backward after {max_retries} retries")
+                    raise
+            except Exception as e:
+                print(f"  Non-retryable error in forward_backward: {e}")
+                raise
         
-        # Optimizer step
-        adam_params = types.AdamParams(learning_rate=learning_rate)
-        self.training_client.optim_step(adam_params).result()
+        if backward_result is None:
+            raise RuntimeError("forward_backward_custom failed to return a result")
+        
+        # Optimizer step (with retry)
+        for retry in range(max_retries):
+            try:
+                adam_params = types.AdamParams(learning_rate=learning_rate)
+                self.training_client.optim_step(adam_params).result()
+                break
+            except RetryableException as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry
+                    print(f"  Retry {retry + 1}/{max_retries} for optim_step, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Failed optim_step after {max_retries} retries")
+                    raise
+            except Exception as e:
+                print(f"  Non-retryable error in optim_step: {e}")
+                raise
         
         return backward_result.metrics
     
