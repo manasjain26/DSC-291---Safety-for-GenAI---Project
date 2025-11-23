@@ -29,7 +29,7 @@ load_dotenv()
 
 class TinkerTrainingClient:
     """
-    Wrapper for Tinker TrainingClient for DPO training.
+    Wrapper for Tinker TrainingClient for DPO and SFT training.
     
     Tinker handles distributed training - you provide the data and loss function,
     they handle the GPU infrastructure.
@@ -73,6 +73,32 @@ class TinkerTrainingClient:
         """Get list of available base models from Tinker."""
         capabilities = self.service_client.get_server_capabilities()
         return [model.model_name for model in capabilities.supported_models]
+    
+    def prepare_sft_datum(
+        self,
+        prompt: str,
+        completion: str
+    ) -> types.Datum:
+        """
+        Prepare SFT training example (prompt + target completion).
+        
+        The prompt tokens have weight 0 and completion tokens weight 1 to compute
+        supervised NLL on the completion only.
+        """
+        prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
+        completion_tokens = self.tokenizer.encode(f" {completion}", add_special_tokens=False)
+        
+        full = prompt_tokens + completion_tokens
+        weights = [0.0] * len(prompt_tokens) + [1.0] * len(completion_tokens)
+        
+        datum = types.Datum(
+            model_input=types.ModelInput.from_ints(tokens=full[:-1]),
+            loss_fn_inputs=dict(
+                target_tokens=TensorData.from_numpy(np.array(full[1:], dtype=np.int32)),
+                weights=TensorData.from_numpy(np.array(weights[1:], dtype=np.float32))
+            )
+        )
+        return datum
     
     def prepare_dpo_datum(
         self,
@@ -125,6 +151,85 @@ class TinkerTrainingClient:
         )
         
         return [chosen_datum, rejected_datum]
+    
+    def train_step_sft(
+        self,
+        batch: List[types.Datum],
+        learning_rate: float = 5e-5,
+        max_retries: int = 3
+    ) -> Dict[str, float]:
+        """
+        Perform one training step for SFT using supervised NLL on completion tokens.
+        
+        Args:
+            batch: List of Datum objects (each a single prompt+completion)
+            learning_rate: Adam learning rate
+            max_retries: Maximum number of retries on transient errors
+            
+        Returns:
+            Dictionary of training metrics (e.g., sft_loss, avg_target_tokens)
+        """
+        if not batch:
+            return {"sft_loss": 0.0, "avg_target_tokens": 0.0}
+        
+        def sft_loss_fn(data: List[types.Datum], logprobs_list: List[torch.Tensor]) -> tuple[torch.Tensor, Dict[str, float]]:
+            per_example_losses = []
+            total_target_tokens = 0.0
+            
+            for datum, logprobs in zip(data, logprobs_list):
+                weights = torch.tensor(datum.loss_fn_inputs["weights"].data).float()
+                # Negative log-likelihood on completion tokens (weights==1)
+                # Normalize by number of target tokens for stability
+                target_len = weights.sum().clamp(min=1.0)
+                nll = -torch.dot(logprobs.float(), weights) / target_len
+                per_example_losses.append(nll)
+                total_target_tokens += float(target_len.item())
+            
+            loss = torch.stack(per_example_losses).mean()
+            metrics = {
+                "sft_loss": float(loss.item()),
+                "avg_target_tokens": total_target_tokens / max(len(data), 1)
+            }
+            return loss, metrics
+        
+        backward_result = None
+        for retry in range(max_retries):
+            try:
+                backward_result = self.training_client.forward_backward_custom(batch, sft_loss_fn).result()
+                break
+            except RetryableException as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry
+                    print(f"  Retry {retry + 1}/{max_retries} for SFT forward_backward, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Failed SFT forward_backward after {max_retries} retries")
+                    raise
+            except Exception as e:
+                print(f"  Non-retryable error in SFT forward_backward: {e}")
+                raise
+        
+        if backward_result is None:
+            raise RuntimeError("SFT forward_backward_custom failed to return a result")
+        
+        for retry in range(max_retries):
+            try:
+                adam_params = types.AdamParams(learning_rate=learning_rate)
+                self.training_client.optim_step(adam_params).result()
+                break
+            except RetryableException as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry
+                    print(f"  Retry {retry + 1}/{max_retries} for SFT optim_step, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Failed SFT optim_step after {max_retries} retries")
+                    raise
+            except Exception as e:
+                print(f"  Non-retryable error in SFT optim_step: {e}")
+                raise
+        
+        return backward_result.metrics
     
     def compute_dpo_loss(
         self,
