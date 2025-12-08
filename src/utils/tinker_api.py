@@ -78,7 +78,8 @@ class TinkerTrainingClient:
         self,
         prompt: str,
         chosen: str,
-        rejected: str
+        rejected: str,
+        max_seq_length: int = 512
     ) -> List[types.Datum]:
         """
         Prepare DPO training examples (chosen and rejected pair).
@@ -90,6 +91,7 @@ class TinkerTrainingClient:
             prompt: The input prompt
             chosen: Preferred response  
             rejected: Rejected response
+            max_seq_length: Maximum sequence length (truncates if longer)
             
         Returns:
             List containing [chosen_datum, rejected_datum]
@@ -98,6 +100,17 @@ class TinkerTrainingClient:
         prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
         chosen_tokens = self.tokenizer.encode(f" {chosen}", add_special_tokens=False)
         rejected_tokens = self.tokenizer.encode(f" {rejected}", add_special_tokens=False)
+        
+        # Truncate if needed (keep prompt, truncate response)
+        max_response_len = max_seq_length - len(prompt_tokens)
+        if max_response_len > 0:
+            chosen_tokens = chosen_tokens[:max_response_len]
+            rejected_tokens = rejected_tokens[:max_response_len]
+        else:
+            # If prompt is too long, truncate prompt and keep some response
+            prompt_tokens = prompt_tokens[:max_seq_length - 50]
+            chosen_tokens = chosen_tokens[:50]
+            rejected_tokens = rejected_tokens[:50]
         
         # Create full sequences
         chosen_full = prompt_tokens + chosen_tokens

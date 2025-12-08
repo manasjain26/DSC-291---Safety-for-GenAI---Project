@@ -28,7 +28,8 @@ class DPOTrainer:
         base_model: str,
         output_dir: str = "./results",
         dpo_beta: float = 0.1,
-        learning_rate: float = 1e-5
+        learning_rate: float = 1e-5,
+        max_seq_length: int = 512
     ):
         """
         Initialize DPO trainer.
@@ -38,23 +39,50 @@ class DPOTrainer:
             output_dir: Directory to save checkpoints
             dpo_beta: DPO beta parameter
             learning_rate: Learning rate
+            max_seq_length: Maximum sequence length (shorter = faster)
         """
         self.base_model = base_model
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dpo_beta = dpo_beta
         self.learning_rate = learning_rate
+        self.max_seq_length = max_seq_length
         
         # Initialize Tinker training client
         print(f"Initializing Tinker training client for {base_model}...")
         self.client = TinkerTrainingClient(base_model=base_model)
         
     def load_dataset(self, dataset_path: str) -> List[Dict]:
-        """Load DPO dataset from JSONL file."""
+        """Load DPO dataset from JSON or JSONL file.
+        
+        Supports:
+        - JSONL files (one JSON object per line)
+        - JSON files (array of objects)
+        
+        Each object must have 'prompt', 'chosen', and 'rejected' fields.
+        """
         data = []
         with open(dataset_path, 'r') as f:
-            for line in f:
-                data.append(json.loads(line.strip()))
+            content = f.read().strip()
+            
+        # Check if it's a JSON array or JSONL
+        if content.startswith('['):
+            # JSON array format
+            data = json.loads(content)
+        else:
+            # JSONL format (one JSON object per line)
+            for line in content.split('\n'):
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        
+        # Validate data format
+        required_fields = {'prompt', 'chosen', 'rejected'}
+        for i, item in enumerate(data):
+            missing = required_fields - set(item.keys())
+            if missing:
+                raise ValueError(f"Item {i} missing required fields: {missing}")
+        
         return data
     
     def train(
@@ -103,7 +131,8 @@ class DPOTrainer:
                     pair_datums = self.client.prepare_dpo_datum(
                         prompt=ex['prompt'],
                         chosen=ex['chosen'],
-                        rejected=ex['rejected']
+                        rejected=ex['rejected'],
+                        max_seq_length=self.max_seq_length
                     )
                     batch.extend(pair_datums)  # Flatten the pairs
                 
@@ -134,6 +163,10 @@ class DPOTrainer:
                     except:
                         pass
                     raise
+            
+            # Save checkpoint after each epoch
+            print(f"\n📝 Saving checkpoint after epoch {epoch + 1}...")
+            self.save_checkpoint(step, epoch=epoch + 1)
         
         # Final save
         print("\nTraining complete! Saving final model...")
@@ -153,10 +186,14 @@ class DPOTrainer:
         
         return sampling_client, final_path
     
-    def save_checkpoint(self, step: int, emergency: bool = False):
+    def save_checkpoint(self, step: int, emergency: bool = False, epoch: Optional[int] = None):
         """Save training checkpoint and return the path."""
-        prefix = "emergency-" if emergency else ""
-        checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-{prefix}step{step}"
+        if emergency:
+            checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-emergency-step{step}"
+        elif epoch is not None:
+            checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-epoch{epoch}"
+        else:
+            checkpoint_name = f"{self.base_model.split('/')[-1]}-dpo-step{step}"
         print(f"  Saving to: {checkpoint_name}")
         result = self.client.training_client.save_weights_for_sampler(name=checkpoint_name).result()
         print(f"  ✓ Checkpoint saved: {result.path}")
@@ -219,6 +256,12 @@ def main():
         default=100,
         help="Save checkpoint every N steps"
     )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=512,
+        help="Maximum sequence length (shorter = faster training)"
+    )
     
     args = parser.parse_args()
     
@@ -227,7 +270,8 @@ def main():
         base_model=args.model,
         output_dir=args.output_dir,
         dpo_beta=args.dpo_beta,
-        learning_rate=args.learning_rate
+        learning_rate=args.learning_rate,
+        max_seq_length=args.max_seq_length
     )
     
     # Train
