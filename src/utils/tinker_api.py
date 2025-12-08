@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import torch
 import time
+import asyncio
 
 try:
     import tinker
@@ -208,30 +209,44 @@ class TinkerTrainingClient:
         chosen_data = [batch[i] for i in range(0, len(batch), 2)]
         rejected_data = [batch[i] for i in range(1, len(batch), 2)]
         
-        # Get reference logprobs for all data with retry logic
-        all_ref_logprobs = []
-        for idx, datum in enumerate(batch):
-            for retry in range(max_retries):
-                try:
-                    # Reconstruct full sequence
-                    target_tokens = datum.loss_fn_inputs["target_tokens"].data
-                    full_seq = datum.model_input.append_int(int(target_tokens[-1]))
-                    
-                    # Compute ref logprobs
-                    result = self.reference_client.compute_logprobs(full_seq).result()
-                    all_ref_logprobs.append(torch.tensor(result[1:]))  # Skip first token
-                    break
-                except RetryableException as e:
-                    if retry < max_retries - 1:
-                        wait_time = 2 ** retry  # Exponential backoff
-                        print(f"  Retry {retry + 1}/{max_retries} for ref logprobs (datum {idx + 1}/{len(batch)}), waiting {wait_time}s...")
-                        time.sleep(wait_time)
-                    else:
-                        print(f"  Failed to get ref logprobs after {max_retries} retries")
-                        raise
-                except Exception as e:
-                    print(f"  Non-retryable error getting ref logprobs: {e}")
+        # Build full sequences for reference logprob computation
+        full_sequences = []
+        for datum in batch:
+            target_tokens = datum.loss_fn_inputs["target_tokens"].data
+            if len(target_tokens) > 0:
+                full_seq = datum.model_input.append_int(int(target_tokens[-1]))
+                full_sequences.append(full_seq)
+            else:
+                full_sequences.append(datum.model_input)
+        
+        # Compute reference log probabilities IN PARALLEL using asyncio.gather
+        # This is the key optimization - all reference logprobs computed at once!
+        
+        async def compute_all_ref_logprobs():
+            return await asyncio.gather(
+                *[self.reference_client.compute_logprobs_async(seq) for seq in full_sequences]
+            )
+        
+        # Run the async computation with retry logic
+        all_ref_logprobs_raw = None
+        for retry in range(max_retries):
+            try:
+                all_ref_logprobs_raw = asyncio.run(compute_all_ref_logprobs())
+                break
+            except RetryableException as e:
+                if retry < max_retries - 1:
+                    wait_time = 2 ** retry
+                    print(f"  Retry {retry + 1}/{max_retries} for ref logprobs, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Failed to get ref logprobs after {max_retries} retries")
                     raise
+        
+        if all_ref_logprobs_raw is None:
+            raise RuntimeError("Failed to compute reference logprobs")
+        
+        # Convert to tensors (skip first token)
+        all_ref_logprobs = [torch.tensor(logprobs[1:]) for logprobs in all_ref_logprobs_raw]
         
         # Split ref logprobs into chosen and rejected
         chosen_ref_logprobs = [all_ref_logprobs[i] for i in range(0, len(batch), 2)]
