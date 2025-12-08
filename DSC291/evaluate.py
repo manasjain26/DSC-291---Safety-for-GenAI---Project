@@ -186,29 +186,6 @@ def evaluate_benign_helpfulness(
             "judge_explanation": judgment["explanation"],
             "response_length": len(response)
         })
-        prompt = item["prompt"]
-        
-        # Generate response using Tinker
-        response = generate_response(model_client, tokenizer, prompt)
-        
-        # Evaluate using LLM judge for benign prompts
-        judgment = llm_judge.judge_benign_over_refusal(prompt, response)
-        over_refused = judgment["is_over_refusal"]
-        is_helpful = judgment["is_helpful"]
-        
-        if over_refused:
-            over_refusals += 1
-        if is_helpful:
-            helpful_responses += 1
-        
-        results.append({
-            "prompt": prompt,
-            "response": response,
-            "over_refused": over_refused,
-            "is_helpful": is_helpful,
-            "judge_explanation": judgment["explanation"],
-            "response_length": len(response)
-        })
     
     over_refusal_rate = (over_refusals / len(results)) * 100
     helpful_rate = (helpful_responses / len(results)) * 100
