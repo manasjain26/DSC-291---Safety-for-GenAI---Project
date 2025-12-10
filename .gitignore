@@ -28,6 +28,10 @@ models/
 *.bin
 *.safetensors
 
+# # Data
+# data/
+# *.json
+# *.csv
 
 # Logs
 logs/
