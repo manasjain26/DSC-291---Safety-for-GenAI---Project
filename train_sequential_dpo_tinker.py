@@ -604,4 +604,4 @@ if __name__ == "__main__":
         print("Training successful")
         print(f"Model name: {model_name}")
         print("To evaluate your model, run:")
-        print(f"  python evaluate_dpo.py --model_id '{sampling_path}'")
+        print(f"  python evaluate_sft.py --model_id '{sampling_path}'")
